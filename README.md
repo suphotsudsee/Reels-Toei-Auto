@@ -31,7 +31,10 @@ curl -fsS http://localhost:8080/health
 
 > การรันครั้งแรกโดยไม่ใส่ API key จะใช้ fallback media/เสียงเงียบเพื่อพิสูจน์การไหลของระบบเท่านั้น งานเผยแพร่จริงควรใส่ provider keys และตรวจเนื้อหาโดยมนุษย์ก่อน post
 
-Dashboard/API docs: `http://VPS-IP:8080/docs`  
+Frontend: `http://VPS-IP:8080/`
+
+API docs: `http://VPS-IP:8080/docs`
+
 MinIO Console: `http://VPS-IP:9001`
 
 สร้างคลิปด้วยตนเอง:
@@ -46,6 +49,12 @@ curl -X POST http://localhost:8080/jobs \
 
 ```bash
 curl http://localhost:8080/jobs/JOB_ID
+```
+
+ดาวน์โหลดวิดีโอเมื่อสถานะเป็น `completed`:
+
+```bash
+curl -OJ http://localhost:8080/jobs/JOB_ID/video
 ```
 
 ## Production checklist
