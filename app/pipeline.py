@@ -95,63 +95,135 @@ def _display_width(text: str) -> float:
 
 
 def _caption_tokens(text: str) -> list[str]:
-    """Tokenize Thai and Latin text while preserving spaces between Latin words."""
-    normalized = re.sub(r"\s+", " ", text).strip()
+    """Return words/punctuation without ever splitting a Unicode grapheme.
+
+    Thai needs dictionary based word boundaries while Latin text must only wrap at
+    whitespace.  Keeping whitespace as tokens also lets the wrapper reproduce the
+    narration exactly (apart from whitespace normalization).
+    """
+    normalized = unicodedata.normalize("NFC", re.sub(r"\s+", " ", text)).strip()
     if not normalized:
         return []
 
     tokens: list[str] = []
-    pattern = r"[A-Za-z0-9]+(?:[-'’][A-Za-z0-9]+)*|[\u0E00-\u0E7F]+|\s+|[^\s]"
+    pattern = r"[A-Za-z0-9]+(?:[-'’./][A-Za-z0-9]+)*|[\u0E00-\u0E7F]+|\s+|[^\s]"
     for part in re.findall(pattern, normalized):
         if re.fullmatch(r"[\u0E00-\u0E7F]+", part):
-            tokens.extend(word_tokenize(part, engine="newmm", keep_whitespace=False))
+            segmented = word_tokenize(part, engine="newmm", keep_whitespace=False)
+            for word in segmented:
+                # Defensive guard: a line must never begin with a floating Thai
+                # vowel/tone mark, even if a tokenizer/custom dictionary returns it.
+                if tokens and word and unicodedata.category(word[0]) in {"Mn", "Me"}:
+                    tokens[-1] += word
+                else:
+                    tokens.append(word)
         else:
             tokens.append(part)
     return tokens
 
 
 def _caption_chunks(text: str, max_line_width: float = 20.0, max_lines: int = 2) -> list[str]:
-    """Create explicit subtitle lines; a token is never split across lines."""
-    chunks: list[str] = []
-    lines: list[str] = []
-    line = ""
+    """Build balanced subtitle cards without splitting Thai or English words."""
+    raw_tokens = _caption_tokens(text)
+    if not raw_tokens:
+        return []
 
-    def flush_line() -> None:
-        nonlocal line, lines, chunks
-        clean = line.rstrip()
-        if clean:
-            lines.append(clean)
-        line = ""
-        if len(lines) == max_lines:
-            chunks.append("\n".join(lines))
-            lines = []
-
-    for token in _caption_tokens(text):
+    # Turn spaces into a prefix of the following token. A line can then start cleanly
+    # without leaving a dangling space at the end of the previous line.
+    units: list[str] = []
+    pending_space = ""
+    pending_prefix = ""
+    closing_punctuation = set(",.!?;:%)]}\u0e2f\u0e46\u0e50\u0e51\u0e52\u0e53\u0e54\u0e55\u0e56\u0e57\u0e58\u0e59")
+    opening_punctuation = set("([{\"'\u201c\u2018")
+    thai_prefixes = {"การ", "ความ", "และ", "หรือ", "กับ", "เพื่อ", "โดย", "จาก", "ถึง", "ต่อ", "เมื่อ", "หาก", "แต่", "จะ", "ไม่", "ให้"}
+    thai_suffixes = {"ขึ้น", "ลง", "แล้ว", "มาก", "น้อย", "ที่สุด", "ครับ", "ค่ะ", "คะ", "นะ", "เลย", "อีก"}
+    for token in raw_tokens:
         if not token:
             continue
         if token.isspace():
-            if line and not line.endswith(" "):
-                line += " "
+            pending_space = " "
+        elif units and token in closing_punctuation:
+            units[-1] += token
+            pending_space = ""
+        elif not pending_space and units and token in thai_suffixes:
+            units[-1] += token
+        elif not pending_space and (token in thai_prefixes or token in opening_punctuation):
+            pending_prefix += token
+        else:
+            units.append(f"{pending_space}{pending_prefix}{token}")
+            pending_space = ""
+            pending_prefix = ""
+    if pending_prefix:
+        if units:
+            units[-1] += pending_prefix
+        else:
+            units.append(pending_prefix)
+
+    def line_text(start: int, end: int) -> str:
+        return "".join(units[start:end]).strip()
+
+    chunks: list[str] = []
+    position = 0
+    while position < len(units):
+        # Find every feasible one/two-line card, prefer the card containing the most
+        # words, then the most visually balanced break. This prevents orphan words.
+        candidates: list[tuple[int, float, int, int]] = []
+        for split in range(position + 1, len(units) + 1):
+            first = line_text(position, split)
+            first_width = _display_width(first)
+            if first_width > max_line_width and split > position + 1:
+                break
+            candidates.append((split, first_width, split, split))
+            if max_lines < 2:
+                continue
+            for end in range(split + 1, len(units) + 1):
+                second_width = _display_width(line_text(split, end))
+                if second_width > max_line_width:
+                    break
+                candidates.append((end, abs(first_width - second_width), split, end))
+
+        if not candidates:
+            # A single unusually long URL/name is kept intact instead of being cut.
+            chunks.append(line_text(position, position + 1))
+            position += 1
             continue
 
-        candidate = f"{line}{token}"
-        if line.strip() and _display_width(candidate) > max_line_width:
-            flush_line()
-            token = token.lstrip()
-        line += token
-
-    flush_line()
-    if lines:
-        chunks.append("\n".join(lines))
+        furthest = max(item[0] for item in candidates)
+        best = min((item for item in candidates if item[0] == furthest), key=lambda item: item[1])
+        _, _, split, end = best
+        first = line_text(position, split)
+        second = line_text(split, end)
+        chunks.append(first if not second else f"{first}\n{second}")
+        position = end
     return chunks
+
+
+def _media_duration(path: Path) -> float:
+    """Read media duration using ffprobe; return zero for an unreadable file."""
+    try:
+        value = run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ]).strip()
+        return max(0.0, float(value))
+    except (subprocess.CalledProcessError, TypeError, ValueError):
+        return 0.0
 
 
 def captions(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
+    planned_total = sum(max(0.0, float(scene.get("seconds", 0))) for scene in data["scenes"])
+    voice_duration = _media_duration(root / "04_voice.mp3")
+    # The TTS audio is the source of truth. Scaling all scene boundaries prevents the
+    # final words from disappearing when narration is longer than the planned script.
+    duration_scale = voice_duration / planned_total if voice_duration > 0 and planned_total > 0 else 1.0
     lines, start, caption_index = [], 0.0, 1
     for scene in data["scenes"]:
-        duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"])))
+        duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"]))) * duration_scale
         chunks = _caption_chunks(scene["narration"])
+        if not chunks:
+            start += duration
+            continue
         weights = [max(_display_width(chunk), 1.0) for chunk in chunks]
         total_weight = sum(weights)
         cue_start = start
@@ -177,10 +249,15 @@ def render(job, root: Path) -> Path:
     normalized = root / "normalized"
     normalized.mkdir(exist_ok=True)
     concat_lines = []
+    script_data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
+    planned_total = sum(max(0.0, float(scene.get("seconds", 0))) for scene in script_data["scenes"])
+    voice_duration = _media_duration(root / "04_voice.mp3")
+    duration_scale = voice_duration / planned_total if voice_duration > 0 and planned_total > 0 else 1.0
     for item in manifest:
         source = root / item["file"]
         target = normalized / source.name
-        run(["ffmpeg", "-y", "-i", str(source), "-t", str(item["seconds"]), "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(target)])
+        duration = max(0.1, float(item["seconds"]) * duration_scale)
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source), "-t", f"{duration:.3f}", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(target)])
         concat_lines.append(f"file '{target.as_posix()}'")
     concat_file = root / "concat.txt"
     concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
