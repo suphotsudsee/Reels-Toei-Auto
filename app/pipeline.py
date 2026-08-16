@@ -1,7 +1,13 @@
 import json
+import math
+import re
 import subprocess
+import unicodedata
 from pathlib import Path
+
 from minio import Minio
+from pythainlp.tokenize import word_tokenize
+
 from .config import settings
 from .providers import download_pexels_video, generate_json, text_to_speech
 
@@ -29,16 +35,16 @@ def research(job, root: Path) -> Path:
 def script(job, root: Path) -> Path:
     notes = (root / "01_research.json").read_text(encoding="utf-8")
     data = generate_json(
-        "You write punchy vertical-video scripts. Return JSON only. Narration must fit the requested duration.",
-        f"Create a {job.target_seconds}-second script in {job.language} from research {notes}. Return hook, scenes (narration, broll_query, seconds), cta and disclaimer.",
+        "You write clear Thai vertical-video scripts. Return JSON only. Every scene narration must use short, natural spoken sentences. Avoid unexplained English abbreviations. The first scene must contain the hook and the final scene must finish the thought and CTA; never end mid-sentence.",
+        f"Create a complete {job.target_seconds}-second script in {job.language} from research {notes}. Aim for narration that can be spoken in {max(15, job.target_seconds - 4)} seconds, leaving a short ending hold. Return hook, scenes (narration, broll_query, seconds), cta and disclaimer. Use 5-7 scenes and keep each narration concise.",
     )
     if not data or not data.get("scenes"):
         scene_seconds = max(5, job.target_seconds // 4)
         data = {"hook": job.topic, "scenes": [
-            {"narration": f"วันนี้เรามารู้จัก {job.topic}", "broll_query": "hospital technology", "seconds": scene_seconds},
-            {"narration": "เทคโนโลยีช่วยลดงานซ้ำซ้อนและทำให้ข้อมูลพร้อมใช้", "broll_query": "doctor using tablet", "seconds": scene_seconds},
-            {"narration": "หัวใจสำคัญคือความปลอดภัย ความถูกต้อง และคนไข้", "broll_query": "healthcare team", "seconds": scene_seconds},
-            {"narration": "ติดตามเพื่อดูตัวอย่างการใช้งานจริง", "broll_query": "modern hospital", "seconds": scene_seconds},
+            {"narration": f"วันนี้ มารู้จัก {job.topic} กันครับ", "broll_query": "hospital technology", "seconds": scene_seconds},
+            {"narration": "เทคโนโลยี ช่วยลดงานซ้ำซ้อน และทำให้ข้อมูลพร้อมใช้", "broll_query": "doctor using tablet", "seconds": scene_seconds},
+            {"narration": "หัวใจสำคัญ คือความปลอดภัย ความถูกต้อง และประโยชน์ของผู้ป่วย", "broll_query": "healthcare team", "seconds": scene_seconds},
+            {"narration": "ติดตามตอนต่อไป เพื่อดูตัวอย่างการใช้งานจริงครับ", "broll_query": "modern hospital", "seconds": scene_seconds},
         ], "cta": "ติดตามตอนต่อไป", "disclaimer": "ข้อมูลเพื่อการสื่อสารทั่วไป", "mode": "offline-fallback"}
     return write_json(root / "02_script.json", data)
 
@@ -59,44 +65,116 @@ def broll(job, root: Path) -> Path:
     return write_json(root / "03_broll.json", {"clips": manifest})
 
 
+def _spoken_text(text: str) -> str:
+    replacements = {"AI": "เอไอ", "A.I.": "เอไอ", "OPD": "โอพีดี", "IPD": "ไอพีดี"}
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def voice(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
-    narration = " ".join(s["narration"] for s in data["scenes"])
+    narration = "\n".join(_spoken_text(s["narration"]) for s in data["scenes"])
     out = root / "04_voice.mp3"
-    generated = text_to_speech(narration, out)
-    if not generated:
-        run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", str(job.target_seconds), "-q:a", "9", "-acodec", "libmp3lame", str(out)])
+    if not text_to_speech(narration, out, language=job.language):
+        raise RuntimeError("สร้างเสียงพากย์ไม่ได้: กรุณาตั้งค่า OPENAI_API_KEY แล้วเริ่มงานใหม่ (ระบบจะไม่สร้างคลิปเสียงเงียบ)")
+    duration = _media_duration(out)
     (root / "04_narration.txt").write_text(narration, encoding="utf-8")
+    write_json(root / "04_voice.json", {"duration_seconds": duration, "narration": narration})
     return out
+
+
+def _media_duration(path: Path) -> float:
+    value = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]).strip()
+    return float(value)
 
 
 def _srt_time(seconds: float) -> str:
     ms = round(seconds * 1000)
-    h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def _clusters(text: str) -> list[str]:
+    clusters: list[str] = []
+    for char in text:
+        if clusters and (unicodedata.combining(char) or unicodedata.category(char) in {"Mn", "Mc", "Me"}):
+            clusters[-1] += char
+        else:
+            clusters.append(char)
+    return clusters
+
+
+def _wrap_caption(text: str, max_chars: int = 18, max_lines: int = 2) -> list[str]:
+    """Split Thai/Latin narration into word-safe, two-line caption cards."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    tokens = word_tokenize(text, engine="newmm", keep_whitespace=True)
+    lines: list[str] = []
+    current = ""
+    for token in tokens:
+        token = token.replace("\n", " ")
+        candidate = current + token
+        if current and len(_clusters(candidate.strip())) > max_chars:
+            lines.append(current.strip())
+            current = token.lstrip()
+        else:
+            current = candidate
+    if current.strip():
+        lines.append(current.strip())
+
+    cards = []
+    for index in range(0, len(lines), max_lines):
+        cards.append("\n".join(lines[index:index + max_lines]))
+    return cards
+
+
+def _scene_durations(data: dict, total_seconds: float) -> list[float]:
+    weights = [max(1, len(_clusters(_spoken_text(scene["narration"])))) for scene in data["scenes"]]
+    total_weight = sum(weights)
+    return [total_seconds * weight / total_weight for weight in weights]
 
 
 def captions(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
-    lines, start = [], 0.0
-    for i, scene in enumerate(data["scenes"], 1):
-        duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"])))
-        lines += [str(i), f"{_srt_time(start)} --> {_srt_time(start + duration)}", scene["narration"], ""]
-        start += duration
+    audio_duration = _media_duration(root / "04_voice.mp3")
+    scene_durations = _scene_durations(data, audio_duration)
+    lines: list[str] = []
+    cue_number = 1
+    start = 0.0
+    for scene, scene_duration in zip(data["scenes"], scene_durations):
+        cards = _wrap_caption(_spoken_text(scene["narration"])) or [""]
+        weights = [max(1, len(_clusters(card.replace("\n", "")))) for card in cards]
+        unit = scene_duration / sum(weights)
+        for card, weight in zip(cards, weights):
+            duration = unit * weight
+            end = min(audio_duration, start + duration)
+            lines += [str(cue_number), f"{_srt_time(start)} --> {_srt_time(end)}", card, ""]
+            cue_number += 1
+            start = end
     out = root / "05_captions.srt"
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
 
 def render(job, root: Path) -> Path:
+    data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
     manifest = json.loads((root / "03_broll.json").read_text(encoding="utf-8"))["clips"]
+    audio_duration = _media_duration(root / "04_voice.mp3")
+    ending_hold = 0.8
+    visual_duration = audio_duration + ending_hold
+    scene_durations = _scene_durations(data, visual_duration)
     normalized = root / "normalized"
     normalized.mkdir(exist_ok=True)
     concat_lines = []
-    for item in manifest:
+    for item, duration in zip(manifest, scene_durations):
         source = root / item["file"]
         target = normalized / source.name
-        run(["ffmpeg", "-y", "-i", str(source), "-t", str(item["seconds"]), "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(target)])
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source), "-t", f"{duration:.3f}", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(target)])
         concat_lines.append(f"file '{target.as_posix()}'")
     concat_file = root / "concat.txt"
     concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
@@ -104,8 +182,9 @@ def render(job, root: Path) -> Path:
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(base)])
     out = root / "06_final.mp4"
     subtitle = (root / "05_captions.srt").as_posix().replace(":", "\\:").replace("'", "\\'")
-    style = "FontName=Noto Sans Thai,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=180"
-    run(["ffmpeg", "-y", "-i", str(base), "-i", str(root / "04_voice.mp3"), "-vf", f"subtitles='{subtitle}':fontsdir=/usr/share/fonts/truetype/noto:force_style='{style}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)])
+    style = "FontName=Noto Sans Thai,FontSize=52,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=1,Alignment=2,MarginL=110,MarginR=110,MarginV=260,WrapStyle=0"
+    audio_filter = f"highpass=f=80,lowpass=f=12000,acompressor=threshold=-18dB:ratio=2.5:attack=20:release=200,loudnorm=I=-16:TP=-1.5:LRA=8,apad=pad_dur={ending_hold}"
+    run(["ffmpeg", "-y", "-i", str(base), "-i", str(root / "04_voice.mp3"), "-vf", f"subtitles='{subtitle}':fontsdir=/usr/share/fonts/truetype/noto:force_style='{style}'", "-af", audio_filter, "-t", f"{visual_duration:.3f}", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)])
     return out
 
 
@@ -116,13 +195,16 @@ def qc(job, root: Path) -> Path:
     v = next((s for s in streams if s.get("codec_type") == "video"), {})
     a = next((s for s in streams if s.get("codec_type") == "audio"), {})
     duration = float(probe.get("format", {}).get("duration", 0))
+    voice_duration = _media_duration(root / "04_voice.mp3")
     checks = {
-        "has_video": bool(v), "has_audio": bool(a),
+        "has_video": bool(v),
+        "has_audio": bool(a),
         "vertical_1080x1920": v.get("width") == 1080 and v.get("height") == 1920,
-        "duration_in_range": 10 <= duration <= 95,
-        "required_artifacts": all((root / x).exists() for x in ["01_research.json", "02_script.json", "03_broll.json", "04_voice.mp3", "05_captions.srt", "06_final.mp4"]),
+        "speech_not_cut": duration >= voice_duration,
+        "duration_in_range": 10 <= duration <= max(95, job.target_seconds + 20),
+        "required_artifacts": all((root / x).exists() for x in ["01_research.json", "02_script.json", "03_broll.json", "04_voice.mp3", "04_voice.json", "05_captions.srt", "06_final.mp4"]),
     }
-    report = {"passed": all(checks.values()), "checks": checks, "duration_seconds": duration, "probe": {"video_codec": v.get("codec_name"), "audio_codec": a.get("codec_name")}}
+    report = {"passed": all(checks.values()), "checks": checks, "duration_seconds": duration, "voice_duration_seconds": voice_duration, "target_seconds": job.target_seconds, "probe": {"video_codec": v.get("codec_name"), "audio_codec": a.get("codec_name")}}
     write_json(root / "07_qc.json", report)
     if not report["passed"]:
         raise RuntimeError(f"QC failed: {checks}")
