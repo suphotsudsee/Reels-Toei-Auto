@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+
 import httpx
 from openai import OpenAI
+
 from .config import settings
 
 
@@ -21,14 +23,22 @@ def generate_json(system: str, prompt: str) -> dict:
     return json.loads(response.choices[0].message.content or "{}")
 
 
-def text_to_speech(text: str, output: Path) -> bool:
+def text_to_speech(text: str, output: Path, language: str = "th") -> bool:
     if not settings.openai_api_key:
         return False
+    instructions = (
+        "พูดภาษาไทยให้ชัดเจน เป็นธรรมชาติ และเป็นมิตร ใช้จังหวะปานกลาง "
+        "เว้นช่วงสั้น ๆ เมื่อขึ้นบรรทัดใหม่ ออกเสียงทุกประโยคให้จบ "
+        "เหมาะสำหรับคลิปความรู้สั้นบนโซเชียลมีเดีย"
+        if language.lower().startswith("th")
+        else "Speak clearly and naturally at a moderate pace. Pause briefly at each line break and finish every sentence."
+    )
     with _client().audio.speech.with_streaming_response.create(
         model=settings.openai_tts_model,
         voice=settings.openai_tts_voice,
         input=text,
-        instructions="Speak naturally, clearly, and energetically for a short social video.",
+        instructions=instructions,
+        speed=settings.openai_tts_speed,
     ) as response:
         response.stream_to_file(output)
     return True
@@ -38,7 +48,11 @@ def download_pexels_video(query: str, output: Path) -> bool:
     if not settings.pexels_api_key:
         return False
     with httpx.Client(timeout=45, follow_redirects=True) as client:
-        data = client.get("https://api.pexels.com/videos/search", params={"query": query, "per_page": 5, "orientation": "portrait"}, headers={"Authorization": settings.pexels_api_key}).json()
+        data = client.get(
+            "https://api.pexels.com/videos/search",
+            params={"query": query, "per_page": 5, "orientation": "portrait"},
+            headers={"Authorization": settings.pexels_api_key},
+        ).json()
         videos = data.get("videos", [])
         if not videos:
             return False
@@ -51,4 +65,3 @@ def download_pexels_video(query: str, output: Path) -> bool:
                 for chunk in response.iter_bytes():
                     fh.write(chunk)
     return True
-

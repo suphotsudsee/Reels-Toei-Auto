@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     openai_text_model: str = "gpt-4.1-mini"
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "coral"
+    openai_tts_speed: float = 0.94
     pexels_api_key: str = ""
     default_topic: str = "AI ในโรงพยาบาล"
     default_language: str = "th"
@@ -24,4 +26,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
