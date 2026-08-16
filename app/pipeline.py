@@ -3,6 +3,7 @@ import subprocess
 import unicodedata
 from pathlib import Path
 from minio import Minio
+from pythainlp.tokenize import word_tokenize
 from .config import settings
 from .providers import download_pexels_video, generate_json, text_to_speech
 
@@ -89,17 +90,35 @@ def _caption_units(text: str) -> list[str]:
     return units
 
 
-def _caption_chunks(text: str, max_units: int = 16, max_lines: int = 2) -> list[str]:
-    """Create short, explicit subtitle lines that cannot overflow a 9:16 frame."""
-    units = _caption_units(text)
-    if not units:
+def _caption_lines(text: str, max_units: int = 16) -> list[str]:
+    """Wrap at Thai word boundaries, falling back to safe character clusters."""
+    normalized = " ".join(text.split())
+    if not normalized:
         return []
 
-    wrapped_lines = [
-        "".join(units[index:index + max_units]).strip()
-        for index in range(0, len(units), max_units)
-    ]
-    wrapped_lines = [line for line in wrapped_lines if line]
+    lines: list[str] = []
+    current = ""
+    for token in word_tokenize(normalized, engine="newmm", keep_whitespace=True):
+        candidate = current + token
+        if current and len(_caption_units(candidate)) > max_units:
+            lines.append(current.rstrip())
+            current = token.lstrip()
+        else:
+            current = candidate
+
+        while len(_caption_units(current)) > max_units:
+            units = _caption_units(current)
+            lines.append("".join(units[:max_units]).rstrip())
+            current = "".join(units[max_units:]).lstrip()
+
+    if current:
+        lines.append(current.rstrip())
+    return [line for line in lines if line]
+
+
+def _caption_chunks(text: str, max_units: int = 16, max_lines: int = 2) -> list[str]:
+    """Create short, explicit subtitle blocks that fit a 9:16 safe zone."""
+    wrapped_lines = _caption_lines(text, max_units=max_units)
     return [
         "\n".join(wrapped_lines[index:index + max_lines])
         for index in range(0, len(wrapped_lines), max_lines)
