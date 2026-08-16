@@ -1,7 +1,10 @@
 import json
+import re
 import subprocess
+import unicodedata
 from pathlib import Path
 from minio import Minio
+from pythainlp.tokenize import word_tokenize
 from .config import settings
 from .providers import download_pexels_video, generate_json, text_to_speech
 
@@ -76,12 +79,93 @@ def _srt_time(seconds: float) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
+def _display_width(text: str) -> float:
+    """Estimate rendered width without treating combining marks as characters."""
+    width = 0.0
+    for char in text:
+        if char.isspace():
+            width += 0.5
+        elif unicodedata.combining(char) or unicodedata.category(char) in {"Mn", "Me"}:
+            continue
+        elif unicodedata.east_asian_width(char) in {"W", "F"}:
+            width += 2.0
+        else:
+            width += 1.0
+    return width
+
+
+def _caption_tokens(text: str) -> list[str]:
+    """Tokenize Thai and Latin text while preserving spaces between Latin words."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+
+    tokens: list[str] = []
+    pattern = r"[A-Za-z0-9]+(?:[-'’][A-Za-z0-9]+)*|[\u0E00-\u0E7F]+|\s+|[^\s]"
+    for part in re.findall(pattern, normalized):
+        if re.fullmatch(r"[\u0E00-\u0E7F]+", part):
+            tokens.extend(word_tokenize(part, engine="newmm", keep_whitespace=False))
+        else:
+            tokens.append(part)
+    return tokens
+
+
+def _caption_chunks(text: str, max_line_width: float = 20.0, max_lines: int = 2) -> list[str]:
+    """Create explicit subtitle lines; a token is never split across lines."""
+    chunks: list[str] = []
+    lines: list[str] = []
+    line = ""
+
+    def flush_line() -> None:
+        nonlocal line, lines, chunks
+        clean = line.rstrip()
+        if clean:
+            lines.append(clean)
+        line = ""
+        if len(lines) == max_lines:
+            chunks.append("\n".join(lines))
+            lines = []
+
+    for token in _caption_tokens(text):
+        if not token:
+            continue
+        if token.isspace():
+            if line and not line.endswith(" "):
+                line += " "
+            continue
+
+        candidate = f"{line}{token}"
+        if line.strip() and _display_width(candidate) > max_line_width:
+            flush_line()
+            token = token.lstrip()
+        line += token
+
+    flush_line()
+    if lines:
+        chunks.append("\n".join(lines))
+    return chunks
+
+
 def captions(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
-    lines, start = [], 0.0
-    for i, scene in enumerate(data["scenes"], 1):
+    lines, start, caption_index = [], 0.0, 1
+    for scene in data["scenes"]:
         duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"])))
-        lines += [str(i), f"{_srt_time(start)} --> {_srt_time(start + duration)}", scene["narration"], ""]
+        chunks = _caption_chunks(scene["narration"])
+        weights = [max(_display_width(chunk), 1.0) for chunk in chunks]
+        total_weight = sum(weights)
+        cue_start = start
+        for chunk, weight in zip(chunks, weights):
+            cue_duration = duration * weight / total_weight
+            cue_end = min(start + duration, cue_start + cue_duration)
+            lines += [
+                str(caption_index),
+                f"{_srt_time(cue_start)} --> {_srt_time(cue_end)}",
+                chunk,
+                "",
+            ]
+            caption_index += 1
+            cue_start = cue_end
         start += duration
     out = root / "05_captions.srt"
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -104,7 +188,7 @@ def render(job, root: Path) -> Path:
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(base)])
     out = root / "06_final.mp4"
     subtitle = (root / "05_captions.srt").as_posix().replace(":", "\\:").replace("'", "\\'")
-    style = "FontName=Noto Sans Thai,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=180"
+    style = "FontName=Noto Sans Thai,FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginL=120,MarginR=120,MarginV=220"
     run(["ffmpeg", "-y", "-i", str(base), "-i", str(root / "04_voice.mp3"), "-vf", f"subtitles='{subtitle}':fontsdir=/usr/share/fonts/truetype/noto:force_style='{style}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)])
     return out
 
