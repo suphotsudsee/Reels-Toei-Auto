@@ -9,3 +9,4 @@ openai==1.99.9
 httpx==0.28.1
 python-multipart==0.0.20
 
+pythainlp==5.3.7
