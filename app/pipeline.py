@@ -1,7 +1,9 @@
 import json
 import subprocess
+import unicodedata
 from pathlib import Path
 from minio import Minio
+from pythainlp.tokenize import word_tokenize
 from .config import settings
 from .providers import download_pexels_video, generate_json, text_to_speech
 
@@ -76,13 +78,72 @@ def _srt_time(seconds: float) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
+def _caption_units(text: str) -> list[str]:
+    """Group combining marks with their base character before wrapping Thai text."""
+    units: list[str] = []
+    for char in " ".join(text.split()):
+        category = unicodedata.category(char)
+        if units and (unicodedata.combining(char) or category in {"Mn", "Mc", "Me"}):
+            units[-1] += char
+        else:
+            units.append(char)
+    return units
+
+
+def _caption_lines(text: str, max_units: int = 16) -> list[str]:
+    """Wrap at Thai word boundaries, falling back to safe character clusters."""
+    normalized = " ".join(text.split())
+    if not normalized:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    for token in word_tokenize(normalized, engine="newmm", keep_whitespace=True):
+        candidate = current + token
+        if current and len(_caption_units(candidate)) > max_units:
+            lines.append(current.rstrip())
+            current = token.lstrip()
+        else:
+            current = candidate
+
+        while len(_caption_units(current)) > max_units:
+            units = _caption_units(current)
+            lines.append("".join(units[:max_units]).rstrip())
+            current = "".join(units[max_units:]).lstrip()
+
+    if current:
+        lines.append(current.rstrip())
+    return [line for line in lines if line]
+
+
+def _caption_chunks(text: str, max_units: int = 16, max_lines: int = 2) -> list[str]:
+    """Create short, explicit subtitle blocks that fit a 9:16 safe zone."""
+    wrapped_lines = _caption_lines(text, max_units=max_units)
+    return [
+        "\n".join(wrapped_lines[index:index + max_lines])
+        for index in range(0, len(wrapped_lines), max_lines)
+    ]
+
+
 def captions(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
-    lines, start = [], 0.0
-    for i, scene in enumerate(data["scenes"], 1):
+    lines, start, caption_number = [], 0.0, 1
+    for scene in data["scenes"]:
         duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"])))
-        lines += [str(i), f"{_srt_time(start)} --> {_srt_time(start + duration)}", scene["narration"], ""]
-        start += duration
+        chunks = _caption_chunks(scene["narration"]) or [""]
+        chunk_duration = duration / len(chunks)
+        scene_end = start + duration
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_start = start + (chunk_index * chunk_duration)
+            chunk_end = scene_end if chunk_index == len(chunks) - 1 else chunk_start + chunk_duration
+            lines += [
+                str(caption_number),
+                f"{_srt_time(chunk_start)} --> {_srt_time(chunk_end)}",
+                chunk,
+                "",
+            ]
+            caption_number += 1
+        start = scene_end
     out = root / "05_captions.srt"
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
@@ -104,7 +165,7 @@ def render(job, root: Path) -> Path:
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(base)])
     out = root / "06_final.mp4"
     subtitle = (root / "05_captions.srt").as_posix().replace(":", "\\:").replace("'", "\\'")
-    style = "FontName=Noto Sans Thai,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=180"
+    style = "FontName=Noto Sans Thai,FontSize=16,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginL=120,MarginR=120,MarginV=320,WrapStyle=2"
     run(["ffmpeg", "-y", "-i", str(base), "-i", str(root / "04_voice.mp3"), "-vf", f"subtitles='{subtitle}':fontsdir=/usr/share/fonts/truetype/noto:force_style='{style}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)])
     return out
 
