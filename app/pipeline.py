@@ -1,5 +1,6 @@
 import json
 import subprocess
+import unicodedata
 from pathlib import Path
 from minio import Minio
 from .config import settings
@@ -76,12 +77,40 @@ def _srt_time(seconds: float) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
+def _graphemes(text: str) -> list[str]:
+    """Split text without separating Thai tone/vowel combining marks."""
+    clusters: list[str] = []
+    for char in text:
+        if clusters and (unicodedata.combining(char) or unicodedata.category(char).startswith("M") or char == "\u200d"):
+            clusters[-1] += char
+        else:
+            clusters.append(char)
+    return clusters
+
+
+def _caption_chunks(text: str, graphemes_per_line: int = 16, lines_per_cue: int = 2) -> list[str]:
+    """Create short two-line cues that always fit inside a vertical-video safe area."""
+    clusters = _graphemes(" ".join(text.split()))
+    lines = []
+    for offset in range(0, len(clusters), graphemes_per_line):
+        line = "".join(clusters[offset:offset + graphemes_per_line]).strip()
+        if line:
+            lines.append(line)
+    return ["\n".join(lines[i:i + lines_per_cue]) for i in range(0, len(lines), lines_per_cue)] or [""]
+
+
 def captions(job, root: Path) -> Path:
     data = json.loads((root / "02_script.json").read_text(encoding="utf-8"))
-    lines, start = [], 0.0
-    for i, scene in enumerate(data["scenes"], 1):
+    lines, start, cue_number = [], 0.0, 1
+    for scene in data["scenes"]:
         duration = float(scene.get("seconds", job.target_seconds / len(data["scenes"])))
-        lines += [str(i), f"{_srt_time(start)} --> {_srt_time(start + duration)}", scene["narration"], ""]
+        cues = _caption_chunks(scene["narration"])
+        cue_duration = duration / len(cues)
+        for cue_index, cue in enumerate(cues):
+            cue_start = start + (cue_index * cue_duration)
+            cue_end = start + ((cue_index + 1) * cue_duration)
+            lines += [str(cue_number), f"{_srt_time(cue_start)} --> {_srt_time(cue_end)}", cue, ""]
+            cue_number += 1
         start += duration
     out = root / "05_captions.srt"
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -104,7 +133,7 @@ def render(job, root: Path) -> Path:
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(base)])
     out = root / "06_final.mp4"
     subtitle = (root / "05_captions.srt").as_posix().replace(":", "\\:").replace("'", "\\'")
-    style = "FontName=Noto Sans Thai,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=180"
+    style = "FontName=Noto Sans Thai,FontSize=13,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=42,MarginR=42,MarginV=50"
     run(["ffmpeg", "-y", "-i", str(base), "-i", str(root / "04_voice.mp3"), "-vf", f"subtitles='{subtitle}':fontsdir=/usr/share/fonts/truetype/noto:force_style='{style}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out)])
     return out
 
