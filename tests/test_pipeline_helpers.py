@@ -1,4 +1,4 @@
-from app.pipeline import _caption_chunks, _caption_units, _srt_time
+from app.pipeline import _caption_chunks, _caption_lines, _caption_units, _srt_time
 
 
 def test_srt_time():
@@ -17,7 +17,11 @@ def test_caption_chunks_fit_reels_safe_zone():
     text = "เทคโนโลยี AI ช่วยลดเวลารอคอยเฉลี่ยในแผนกฉุกเฉินและทำให้ผู้ป่วยได้รับการดูแลรวดเร็วขึ้น"
     chunks = _caption_chunks(text)
 
+    lines = _caption_lines(text)
+
     assert len(chunks) > 1
+    assert any("ลด" in line for line in lines)
+    assert any("รวดเร็ว" in line for line in lines)
     assert all(len(chunk.splitlines()) <= 2 for chunk in chunks)
     assert all(
         len(_caption_units(line)) <= 16
