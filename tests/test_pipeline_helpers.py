@@ -1,4 +1,6 @@
-from app.pipeline import _caption_chunks, _srt_time
+from pathlib import Path
+
+from app.pipeline import _caption_chunks, _parse_srt, _srt_time
 
 
 def test_srt_time():
@@ -27,3 +29,12 @@ def test_caption_chunks_preserve_thai_text():
 
     assert "".join(chunks).replace("\n", "") == text
 
+
+def test_parse_srt_preserves_multiline_thai(tmp_path: Path):
+    srt = tmp_path / "captions.srt"
+    srt.write_text(
+        "1\n00:00:00,000 --> 00:00:02,500\nภาษาไทย\nอ่านง่าย\n",
+        encoding="utf-8",
+    )
+
+    assert _parse_srt(srt) == [(0.0, 2.5, "ภาษาไทย\nอ่านง่าย")]
